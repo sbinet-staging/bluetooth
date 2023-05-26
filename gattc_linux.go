@@ -14,6 +14,11 @@ import (
 	"github.com/muka/go-bluetooth/bluez/profile/gatt"
 )
 
+var (
+	errNilCallback = errors.New("must provide a callback for EnableNotifications")
+	errDupNotif    = errors.New("unclosed notifications")
+)
+
 // UUIDWrapper is a type alias for UUID so we ensure no conflicts with
 // struct method of the same name.
 type uuidWrapper = UUID
@@ -133,6 +138,7 @@ type DeviceCharacteristic struct {
 	uuidWrapper
 
 	characteristic *gatt.GattCharacteristic1
+	property       chan *bluez.PropertyChanged // channel where notifications are reported
 }
 
 // UUID returns the UUID for this DeviceCharacteristic.
@@ -238,19 +244,58 @@ func (c DeviceCharacteristic) WriteWithoutResponse(p []byte) (n int, err error) 
 // Configuration Descriptor (CCCD). This means that most peripherals will send a
 // notification with a new value every time the value of the characteristic
 // changes.
-func (c DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) error {
+func (c *DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) error {
+	if callback == nil {
+		return errNilCallback
+	}
+
+	if c.property != nil {
+		return errDupNotif
+	}
+
 	ch, err := c.characteristic.WatchProperties()
 	if err != nil {
 		return err
 	}
+
+	err = c.characteristic.StartNotify()
+	if err != nil {
+		_ = c.characteristic.UnwatchProperties(ch)
+		return nil, err
+	}
+	c.property = ch
+
 	go func() {
 		for update := range ch {
+			if update == nil {
+				continue
+			}
 			if update.Interface == "org.bluez.GattCharacteristic1" && update.Name == "Value" {
 				callback(update.Value.([]byte))
 			}
 		}
 	}()
-	return c.characteristic.StartNotify()
+
+	return nil
+}
+
+// DisableNotifications disables notifications in the Client Characteristic
+// Configuration Descriptor (CCCD).
+func (c *DeviceCharacteristic) DisableNotifications() error {
+	e1 := c.characteristic.StopNotify()
+	e2 := c.characteristic.UnwatchProperties(c.property)
+	c.property = nil
+
+	// FIXME(sbinet): use errors.Join(e1, e2)
+	if e1 != nil {
+		return e1
+	}
+
+	if e2 != nil {
+		return e2
+	}
+
+	return nil
 }
 
 // GetMTU returns the MTU for the characteristic.
